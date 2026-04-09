@@ -864,5 +864,72 @@ def load_bundle(artifact_dir: str):
     model.eval()
     return model, config, pos_vocab, side_vocab, role_vocab, bundle
 
+def predict_from_test_input(
+    test_input_path: str,
+    artifact_dir: str,
+    template_path: Optional[str] = None,
+    output_path: str = "submission.csv",
+    full_output_path: str = "predictions_full.csv",
+):
+    model, config, pos_vocab, side_vocab, role_vocab, bundle = load_bundle(artifact_dir)
 
+    test_input = pd.read_csv(test_input_path)
+    test_input = preprocess_input_df(test_input)
+    ds = NFLTrajectoryDataset(test_input, None, pos_vocab, side_vocab, role_vocab, None)
+    loader = DataLoader(ds, batch_size=config.batch_size, shuffle=False, collate_fn=collate_plays, num_workers=0)
+
+    rows = []
+    device = config.device
+    with torch.no_grad():
+        for batch in loader:
+            batch = move_batch_to_device(batch, device)
+            out = model(batch)
+            pred = out["pred_xy"].cpu().numpy()  # [B,H,N,2]
+
+            B = pred.shape[0]
+            for b in range(B):
+                game_id = batch["game_ids"][b]
+                play_id = batch["play_ids"][b]
+                H = int(batch["hor_lengths"][b].item())
+                player_ids = batch["player_ids"][b].cpu().numpy()
+                target_flags = batch["static_cont"][b, :, 3].cpu().numpy()
+                for j, nfl_id in enumerate(player_ids):
+                    if nfl_id < 0 or target_flags[j] < 0.5:
+                        continue
+                    for h in range(H):
+                        rows.append({
+                            "game_id": int(game_id),
+                            "play_id": int(play_id),
+                            "nfl_id": int(nfl_id),
+                            "frame_id": int(h + 1),
+                            "x": float(pred[b, h, j, 0]),
+                            "y": float(pred[b, h, j, 1]),
+                        })
+
+    pred_df = pd.DataFrame(rows).sort_values(["game_id", "play_id", "nfl_id", "frame_id"]).reset_index(drop=True)
+
+    if template_path is not None and os.path.exists(template_path):
+        template = pd.read_csv(template_path)
+        merge_cols = ["game_id", "play_id", "nfl_id", "frame_id"]
+        full_df = template.merge(pred_df, on=merge_cols, how="left")
+        if "id" in full_df.columns:
+            submission = full_df[["id", "x", "y"]].copy()
+            submission.to_csv(output_path, index=False)
+        full_df.to_csv(full_output_path, index=False)
+        return submission if "id" in full_df.columns else full_df
+
+    pred_df.to_csv(full_output_path, index=False)
+    return pred_df
+
+
+def validate_on_file(test_input_path: str, truth_template_path: str, artifact_dir: str):
+    pred = predict_from_test_input(
+        test_input_path=test_input_path,
+        artifact_dir=artifact_dir,
+        template_path=truth_template_path,
+        output_path="tmp_submission.csv",
+        full_output_path="tmp_predictions_full.csv",
+    )
+    print("Prediction file saved.")
+    return pred
         
