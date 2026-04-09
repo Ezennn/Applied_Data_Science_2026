@@ -425,3 +425,444 @@ class GraphInteractionBlock(nn.Module):
 
         out = self.norm(x + self.out(torch.cat([x, msg], dim=-1)))
         return out, attn
+def pairwise_edge_features(pos, vel, side_ids, role_ids, target_flag):
+    # pos: [B,N,2], vel: [B,N,2]
+    rel_pos = pos.unsqueeze(2) - pos.unsqueeze(1)  # i - j
+    rel_vel = vel.unsqueeze(2) - vel.unsqueeze(1)
+    dist = torch.linalg.norm(rel_pos, dim=-1, keepdim=True).clamp_min(1e-3)
+    unit = rel_pos / dist
+    closing = (rel_vel * unit).sum(dim=-1, keepdim=True)
+    dot_rv = (rel_pos * rel_vel).sum(dim=-1, keepdim=True)
+    speed_sq = (rel_vel ** 2).sum(dim=-1, keepdim=True) + 1e-3
+    ttc = (-dot_rv / speed_sq).clamp(-10.0, 10.0)
+    los_rate = (
+        rel_pos[..., 0:1] * rel_vel[..., 1:2] - rel_pos[..., 1:2] * rel_vel[..., 0:1]
+    ) / (dist ** 2 + 1e-3)
+
+    same_side = (side_ids.unsqueeze(2) == side_ids.unsqueeze(1)).float().unsqueeze(-1)
+    same_role = (role_ids.unsqueeze(2) == role_ids.unsqueeze(1)).float().unsqueeze(-1)
+    tgt_pair = (target_flag.unsqueeze(2) * target_flag.unsqueeze(1)).unsqueeze(-1)
+    feat = torch.cat([
+        rel_pos,
+        rel_vel,
+        dist,
+        unit,
+        closing,
+        ttc,
+        los_rate,
+        same_side,
+        same_role,
+        tgt_pair,
+    ], dim=-1)
+    return feat
+
+
+class PhysicsAwareDecoder(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.ctrl_head = nn.Sequential(
+            nn.Linear(config.d_model + 10, config.d_model),
+            nn.SiLU(),
+            nn.Linear(config.d_model, 3),
+        )
+        self.overflow_head = nn.Sequential(
+            nn.Linear(config.d_model + 10, config.d_model // 2),
+            nn.SiLU(),
+            nn.Linear(config.d_model // 2, 1),
+        )
+
+    def forward(self, h, pos, vel, body_ang, move_ang, static_ctx, ball_ctx, target_flag):
+        # h: [B,N,D], pos/vel [B,N,2], angles [B,N,1]
+        gap = wrap_to_pi(move_ang - body_ang)
+        decoder_in = torch.cat([
+            h,
+            pos,
+            vel,
+            torch.sin(body_ang), torch.cos(body_ang),
+            torch.sin(move_ang), torch.cos(move_ang),
+            torch.sin(gap), torch.cos(gap),
+        ], dim=-1)
+        raw = self.ctrl_head(decoder_in)
+        a_forward = raw[..., 0:1]
+        a_lat = raw[..., 1:2]
+        yaw_ctrl = torch.tanh(raw[..., 2:3]) * self.config.max_yaw_rate
+
+        orient_gate = 0.25 + 0.75 * torch.sigmoid(2.0 * torch.cos(gap))
+        a_lat_eff = a_lat * orient_gate
+
+        a_local = torch.cat([a_forward, a_lat_eff], dim=-1)
+        a_norm = torch.linalg.norm(a_local, dim=-1, keepdim=True).clamp_min(1e-6)
+        a_max = self.config.friction_accel_limit
+        scale = torch.clamp(a_max / a_norm, max=1.0)
+        overflow = F.relu(a_norm - a_max)
+        a_local_clip = a_local * scale
+
+        c = torch.cos(body_ang)
+        s = torch.sin(body_ang)
+        ax = a_local_clip[..., 0:1] * c - a_local_clip[..., 1:2] * s
+        ay = a_local_clip[..., 0:1] * s + a_local_clip[..., 1:2] * c
+        acc = torch.cat([ax, ay], dim=-1)
+
+        vel_next = vel + DT * acc
+        speed_next = torch.linalg.norm(vel_next, dim=-1, keepdim=True).clamp_min(1e-6)
+        speed_scale = torch.clamp(self.config.max_speed / speed_next, max=1.0)
+        vel_next = vel_next * speed_scale
+
+        pos_next = pos + DT * vel_next
+        pos_next[..., 0] = pos_next[..., 0].clamp(FIELD_X_MIN, FIELD_X_MAX)
+        pos_next[..., 1] = pos_next[..., 1].clamp(FIELD_Y_MIN, FIELD_Y_MAX)
+
+        desired_move_ang = torch.atan2(vel_next[..., 1:2], vel_next[..., 0:1] + 1e-6)
+        body_next = body_ang + DT * yaw_ctrl + 0.15 * wrap_to_pi(desired_move_ang - body_ang)
+        move_next = desired_move_ang
+
+        # Non-target nodes are softly pulled toward constant-velocity prior
+        pos_cv = pos + DT * vel
+        vel_cv = vel
+        non_target = (1.0 - target_flag.unsqueeze(-1))
+        alpha = self.config.non_target_blend
+        pos_next = pos_next * (1.0 - non_target * alpha) + pos_cv * (non_target * alpha)
+        vel_next = vel_next * (1.0 - non_target * alpha) + vel_cv * (non_target * alpha)
+
+        return pos_next, vel_next, body_next, move_next, overflow.squeeze(-1)
+
+
+class TrajectoryGNN(nn.Module):
+    def __init__(self, config: ModelConfig, n_pos: int, n_side: int, n_role: int):
+        super().__init__()
+        self.config = config
+        self.pos_emb = nn.Embedding(n_pos, 16)
+        self.side_emb = nn.Embedding(n_side, 4)
+        self.role_emb = nn.Embedding(n_role, 16)
+
+        self.static_proj = nn.Sequential(
+            nn.Linear(4 + 16 + 4 + 16, config.static_dim),
+            nn.SiLU(),
+            nn.Linear(config.static_dim, config.static_dim),
+        )
+        self.obs_proj = nn.Sequential(
+            nn.Linear(config.obs_feat_dim + config.static_dim, config.d_model),
+            nn.SiLU(),
+            nn.Linear(config.d_model, config.d_model),
+        )
+        self.obs_graph = nn.ModuleList([
+            GraphInteractionBlock(config.d_model, config.edge_dim, config.dropout)
+            for _ in range(config.num_graph_layers)
+        ])
+        self.obs_edge_proj = nn.Sequential(
+            nn.Linear(13, config.edge_dim),
+            nn.SiLU(),
+            nn.Linear(config.edge_dim, config.edge_dim),
+        )
+
+        self.obs_gru = nn.GRU(config.d_model, config.d_model, batch_first=True)
+
+        self.dec_graph = nn.ModuleList([
+            GraphInteractionBlock(config.d_model, config.edge_dim, config.dropout)
+            for _ in range(config.num_graph_layers)
+        ])
+        self.dec_edge_proj = nn.Sequential(
+            nn.Linear(13, config.edge_dim),
+            nn.SiLU(),
+            nn.Linear(config.edge_dim, config.edge_dim),
+        )
+        self.decoder = PhysicsAwareDecoder(config)
+
+    def encode_static(self, static_cont, pos_ids, side_ids, role_ids):
+        x = torch.cat([
+            static_cont,
+            self.pos_emb(pos_ids),
+            self.side_emb(side_ids),
+            self.role_emb(role_ids),
+        ], dim=-1)
+        return self.static_proj(x)
+
+
+    def forward(self, batch):
+        obs_feats = batch["obs_feats"]          # [B,T,N,F]
+        obs_mask = batch["obs_mask"]            # [B,T,N]
+        static_cont = batch["static_cont"]      # [B,N,4]
+        pos_ids = batch["pos_ids"]
+        side_ids = batch["side_ids"]
+        role_ids = batch["role_ids"]
+        node_mask = batch["node_mask"]
+        hor_lengths = batch["hor_lengths"]
+
+        B, T, N, Fdim = obs_feats.shape
+        H = int(hor_lengths.max().item())
+
+        static_ctx = self.encode_static(static_cont, pos_ids, side_ids, role_ids)  # [B,N,S]
+        static_seq = static_ctx.unsqueeze(1).expand(B, T, N, static_ctx.shape[-1])
+        obs_in = self.obs_proj(torch.cat([obs_feats, static_seq], dim=-1))          # [B,T,N,D]
+
+        flat = obs_in.permute(0, 2, 1, 3).reshape(B * N, T, self.config.d_model)
+        _, h_last = self.obs_gru(flat)
+        h = h_last.squeeze(0).reshape(B, N, self.config.d_model)
+
+        last_idx = (batch["obs_lengths"] - 1).view(B, 1, 1, 1).expand(B, 1, N, Fdim)
+        last_frame = torch.gather(obs_feats, 1, last_idx).squeeze(1)  # [B,N,F]
+        pos = last_frame[..., 0:2]
+        vel = last_frame[..., 2:4]
+        body_ang = torch.atan2(last_frame[..., 10:11], last_frame[..., 11:12] + 1e-6)
+        move_ang = torch.atan2(vel[..., 1:2], vel[..., 0:1] + 1e-6)
+        target_flag = static_cont[..., 3]
+
+        # One social-context graph update at the last observed frame
+        edge_raw = pairwise_edge_features(pos, vel, side_ids, role_ids, target_flag)
+        edge_feat = self.obs_edge_proj(edge_raw)
+        for layer in self.obs_graph:
+            h, _ = layer(h, edge_feat, node_mask)
+
+        preds = []
+        overflows = []
+        attn_seq = []
+        for step in range(H):
+            edge_raw = pairwise_edge_features(pos, vel, side_ids, role_ids, target_flag)
+            edge_feat = self.dec_edge_proj(edge_raw)
+            for layer in self.dec_graph:
+                h, attn = layer(h, edge_feat, node_mask)
+                attn_seq.append(attn)
+            pos, vel, body_ang, move_ang, overflow = self.decoder(
+                h=h,
+                pos=pos,
+                vel=vel,
+                body_ang=body_ang,
+                move_ang=move_ang,
+                static_ctx=static_ctx,
+                ball_ctx=batch["ball_land_xy"],
+                target_flag=target_flag,
+            )
+            preds.append(pos)
+            overflows.append(overflow)
+
+        pred_xy = torch.stack(preds, dim=1)          # [B,H,N,2]
+        overflow = torch.stack(overflows, dim=1)     # [B,H,N]
+        return {
+            "pred_xy": pred_xy,
+            "overflow": overflow,
+            "attn_seq": attn_seq,
+        }
+
+
+def masked_smooth_l1(pred, target, mask, beta=1.0):
+    valid = mask > 0
+    if valid.sum() == 0:
+        return pred.sum() * 0.0
+    return F.smooth_l1_loss(pred[valid], target[valid], beta=beta)
+
+
+def compute_loss(model_out, batch):
+    pred_xy = model_out["pred_xy"]
+    target_xy = batch["target_xy"]
+    target_mask = batch["target_mask"]
+
+    valid_mask = target_mask.unsqueeze(-1).expand_as(pred_xy)
+    pos_loss = masked_smooth_l1(pred_xy, target_xy, valid_mask)
+
+    # Future step smoothness
+    if pred_xy.shape[1] > 1:
+        pred_d = pred_xy[:, 1:] - pred_xy[:, :-1]
+        step_loss = pred_d.pow(2).mean()
+    else:
+        step_loss = pred_xy.sum() * 0.0
+
+    # Endpoint emphasis on last available target frame
+    endpoint_losses = []
+    for b in range(pred_xy.shape[0]):
+        h = int(batch["hor_lengths"][b].item())
+        if h > 0:
+            pm = target_mask[b, h - 1] > 0
+            if pm.any():
+                endpoint_losses.append(F.smooth_l1_loss(pred_xy[b, h - 1, pm], target_xy[b, h - 1, pm]))
+    endpoint_loss = torch.stack(endpoint_losses).mean() if endpoint_losses else pred_xy.sum() * 0.0
+
+    friction_penalty = model_out["overflow"].mean()
+
+    # Attention smoothness
+    attn_seq = model_out["attn_seq"]
+    if len(attn_seq) > 1:
+        diffs = [(attn_seq[i] - attn_seq[i - 1]).abs().mean() for i in range(1, len(attn_seq))]
+        attn_smooth = torch.stack(diffs).mean()
+    else:
+        attn_smooth = pred_xy.sum() * 0.0
+
+    total = pos_loss + 0.10 * step_loss + 0.35 * endpoint_loss + 0.05 * friction_penalty + 0.01 * attn_smooth
+    metrics = {
+        "loss": total.detach().item(),
+        "pos_loss": pos_loss.detach().item(),
+        "endpoint_loss": endpoint_loss.detach().item(),
+        "friction_penalty": friction_penalty.detach().item(),
+    }
+    return total, metrics
+
+
+def split_play_keys(keys: List[Tuple[int, int]], val_frac: float = 0.15, seed: int = 42):
+    rng = random.Random(seed)
+    keys = list(keys)
+    rng.shuffle(keys)
+    n_val = max(1, int(len(keys) * val_frac))
+    val_keys = keys[:n_val]
+    train_keys = keys[n_val:]
+    return train_keys, val_keys
+
+
+def move_batch_to_device(batch, device):
+    out = {}
+    for k, v in batch.items():
+        if torch.is_tensor(v):
+            out[k] = v.to(device)
+        else:
+            out[k] = v
+    return out
+
+
+def evaluate(model, loader, device):
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = move_batch_to_device(batch, device)
+            out = model(batch)
+            loss, metrics = compute_loss(out, batch)
+            losses.append(metrics["loss"])
+    return float(np.mean(losses)) if losses else np.nan
+
+
+def train_model(model, train_loader, val_loader, config: ModelConfig, save_path: str):
+    device = config.device
+    model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    best_val = float("inf")
+    best_epoch = -1
+
+    history = []
+    for epoch in range(config.num_epochs):
+        model.train()
+        epoch_losses = []
+        for batch in train_loader:
+            batch = move_batch_to_device(batch, device)
+            optimizer.zero_grad(set_to_none=True)
+            out = model(batch)
+            loss, metrics = compute_loss(out, batch)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            optimizer.step()
+            epoch_losses.append(metrics["loss"])
+
+        train_loss = float(np.mean(epoch_losses)) if epoch_losses else np.nan
+        val_loss = evaluate(model, val_loader, device)
+        history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
+        print(f"Epoch {epoch+1:02d} | train {train_loss:.5f} | val {val_loss:.5f}")
+
+        if val_loss < best_val - 1e-4:
+            best_val = val_loss
+            best_epoch = epoch
+            torch.save(model.state_dict(), save_path)
+
+        if epoch + 1 >= config.min_epochs and epoch - best_epoch >= config.patience:
+            print("Early stopping.")
+            break
+
+    if os.path.exists(save_path):
+        model.load_state_dict(torch.load(save_path, map_location=device))
+    return history
+
+
+def build_vocabs(input_df: pd.DataFrame):
+    return (
+        CategoryVocab(input_df["player_position"].astype(str).tolist()),
+        CategoryVocab(input_df["player_side"].astype(str).tolist()),
+        CategoryVocab(input_df["player_role"].astype(str).tolist()),
+    )
+
+
+def preprocess_input_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = canonicalize_play_direction(df)
+    df = add_derived_observed_features(df)
+    return df
+
+
+def preprocess_output_df(df: pd.DataFrame, input_ref_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    out = df.copy()
+    # Output uses relative frame ids and x,y only. Canonicalization for x/y must match input play direction.
+    if input_ref_df is not None and "play_direction" in input_ref_df.columns:
+        play_dir = (
+            input_ref_df[["game_id", "play_id", "play_direction"]]
+            .drop_duplicates(["game_id", "play_id"])
+        )
+        out = out.merge(play_dir, on=["game_id", "play_id"], how="left")
+        out = canonicalize_play_direction(out)
+        if "play_direction" in out.columns:
+            out = out.drop(columns=["play_direction_canonical"], errors="ignore")
+    return out
+
+
+def fit_pipeline(data_dir: str, artifact_dir: str = "./artifacts", config: Optional[ModelConfig] = None):
+    os.makedirs(artifact_dir, exist_ok=True)
+    config = config or ModelConfig()
+    seed_everything(config.seed)
+
+    files = discover_competition_files(data_dir)
+    train_input = concat_csvs(files["train_input"])
+    train_output = concat_csvs(files["train_output"])
+
+    if train_input is None or train_output is None:
+        raise FileNotFoundError("Could not find train_input*.csv and train_output*.csv in the provided data_dir.")
+
+    print("Preprocessing train_input...")
+    train_input = preprocess_input_df(train_input)
+    print("Preprocessing train_output...")
+    train_output = preprocess_output_df(train_output, train_input)
+
+    pos_vocab, side_vocab, role_vocab = build_vocabs(train_input)
+
+    all_keys = sorted(train_input.groupby(["game_id", "play_id"]).size().index.tolist())
+    train_keys, val_keys = split_play_keys(all_keys, config.val_frac, config.seed)
+
+    train_ds = NFLTrajectoryDataset(train_input, train_output, pos_vocab, side_vocab, role_vocab, train_keys)
+    val_ds = NFLTrajectoryDataset(train_input, train_output, pos_vocab, side_vocab, role_vocab, val_keys)
+
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, collate_fn=collate_plays, num_workers=config.num_workers)
+    val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, collate_fn=collate_plays, num_workers=config.num_workers)
+
+    model = TrajectoryGNN(config, len(pos_vocab), len(side_vocab), len(role_vocab))
+    save_path = os.path.join(artifact_dir, "best_model.pt")
+    history = train_model(model, train_loader, val_loader, config, save_path)
+
+    bundle = {
+        "config": asdict(config),
+        "pos_vocab": pos_vocab.itos,
+        "side_vocab": side_vocab.itos,
+        "role_vocab": role_vocab.itos,
+        "history": history,
+    }
+    with open(os.path.join(artifact_dir, "bundle.pkl"), "wb") as f:
+        pickle.dump(bundle, f)
+
+    pd.DataFrame(history).to_csv(os.path.join(artifact_dir, "training_history.csv"), index=False)
+    print(f"Saved artifacts to {artifact_dir}")
+    return model, bundle
+
+
+def load_bundle(artifact_dir: str):
+    with open(os.path.join(artifact_dir, "bundle.pkl"), "rb") as f:
+        bundle = pickle.load(f)
+    config = ModelConfig(**bundle["config"])
+    pos_vocab = CategoryVocab([])
+    pos_vocab.itos = bundle["pos_vocab"]
+    pos_vocab.stoi = {v: i for i, v in enumerate(pos_vocab.itos)}
+    side_vocab = CategoryVocab([])
+    side_vocab.itos = bundle["side_vocab"]
+    side_vocab.stoi = {v: i for i, v in enumerate(side_vocab.itos)}
+    role_vocab = CategoryVocab([])
+    role_vocab.itos = bundle["role_vocab"]
+    role_vocab.stoi = {v: i for i, v in enumerate(role_vocab.itos)}
+    model = TrajectoryGNN(config, len(pos_vocab), len(side_vocab), len(role_vocab))
+    model.load_state_dict(torch.load(os.path.join(artifact_dir, "best_model.pt"), map_location=config.device))
+    model.to(config.device)
+    model.eval()
+    return model, config, pos_vocab, side_vocab, role_vocab, bundle
+
+
+        
