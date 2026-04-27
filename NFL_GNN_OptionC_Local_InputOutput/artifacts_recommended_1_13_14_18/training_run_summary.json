@@ -1,0 +1,79 @@
+{
+  "best_model_path": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\artifacts_recommended_1_13_14_18\\best_model.pt",
+  "settings_path": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\artifacts_recommended_1_13_14_18\\recommended_experiment_settings.json",
+  "history_rows": 48,
+  "history_last": {
+    "epoch": 48,
+    "val_monitor_name": "kaggle_rmse",
+    "val_monitor_score": 0.6516781602250286,
+    "train_loss": -2.671638930780397,
+    "val_loss": -2.5458680867347203,
+    "val_kaggle_rmse": 0.6516781602250286,
+    "train_track_loss_raw": 0.10591284466488074,
+    "train_vel_loss_raw": 0.005916102677096337
+  },
+  "has_holdout_summary": true,
+  "holdout_summary": {
+    "preprocessed_dir": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly",
+    "artifact_dir": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\artifacts_recommended_1_13_14_18",
+    "eval_weeks": [
+      14,
+      15,
+      16,
+      17,
+      18
+    ],
+    "overall_kaggle_rmse": 0.6486105027953312,
+    "overall_n_rows": 164854,
+    "weeks": [
+      {
+        "week_key": "2023_w14",
+        "input_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly\\preprocessed_train_input_2023_w14.csv",
+        "truth_output_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly\\preprocessed_train_output_2023_w14.csv",
+        "prediction_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18\\predictions_2023_w14.csv",
+        "evaluation_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18\\evaluation_2023_w14.csv",
+        "kaggle_rmse": 0.6217806420414536,
+        "n_rows": 32873
+      },
+      {
+        "week_key": "2023_w15",
+        "input_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly\\preprocessed_train_input_2023_w15.csv",
+        "truth_output_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly\\preprocessed_train_output_2023_w15.csv",
+        "prediction_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18\\predictions_2023_w15.csv",
+        "evaluation_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18\\evaluation_2023_w15.csv",
+        "kaggle_rmse": 0.6193185912053826,
+        "n_rows": 32715
+      },
+      {
+        "week_key": "2023_w16",
+        "input_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly\\preprocessed_train_input_2023_w16.csv",
+        "truth_output_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly\\preprocessed_train_output_2023_w16.csv",
+        "prediction_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18\\predictions_2023_w16.csv",
+        "evaluation_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18\\evaluation_2023_w16.csv",
+        "kaggle_rmse": 0.726452977007977,
+        "n_rows": 36508
+      },
+      {
+        "week_key": "2023_w17",
+        "input_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly\\preprocessed_train_input_2023_w17.csv",
+        "truth_output_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly\\preprocessed_train_output_2023_w17.csv",
+        "prediction_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18\\predictions_2023_w17.csv",
+        "evaluation_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18\\evaluation_2023_w17.csv",
+        "kaggle_rmse": 0.6305488962406568,
+        "n_rows": 33076
+      },
+      {
+        "week_key": "2023_w18",
+        "input_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly\\preprocessed_train_input_2023_w18.csv",
+        "truth_output_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\preprocessed_csv_weekly\\preprocessed_train_output_2023_w18.csv",
+        "prediction_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18\\predictions_2023_w18.csv",
+        "evaluation_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18\\evaluation_2023_w18.csv",
+        "kaggle_rmse": 0.627272553304585,
+        "n_rows": 29682
+      }
+    ]
+  },
+  "artifacts_dir": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\artifacts_recommended_1_13_14_18",
+  "holdout_dir": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\holdout_predictions_recommended_14_18",
+  "history_csv": "C:\\Users\\admin\\Desktop\\NFL_GNN_OptionC_Local_InputOutput\\artifacts_recommended_1_13_14_18\\training_history.csv"
+}

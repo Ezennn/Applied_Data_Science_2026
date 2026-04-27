@@ -1,0 +1,76 @@
+{
+  "train_weeks": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13
+  ],
+  "val_weeks": [
+    14,
+    15,
+    16,
+    17,
+    18
+  ],
+  "learned_by_training": [
+    "all_main_network_weights",
+    "relative_weight_between_track_loss_and_vel_loss_via_uncertainty_main"
+  ],
+  "tuned_manually": {
+    "d_model": 32,
+    "edge_dim": 8,
+    "static_dim": 16,
+    "dropout": 0.1,
+    "lr": 0.0002,
+    "batch_size": 2,
+    "weight_decay": 1e-05,
+    "num_epochs": 80,
+    "patience": 12,
+    "horizon_weight_lambda": 1.5,
+    "target_player_weight": 2.5
+  },
+  "fixed_in_code": {
+    "loss_weighting": "uncertainty_main",
+    "friction_accel_limit": 6.5,
+    "max_speed": 11.5,
+    "max_yaw_rate": 6.0,
+    "track_loss_beta": 1.0,
+    "velocity_loss_beta": 0.5,
+    "horizon_weight_power": 2.0,
+    "non_target_player_weight": 0.35,
+    "phys_loss_weight": 0.02,
+    "attn_loss_weight": 0.001,
+    "phys_warmup_frac": 0.2,
+    "attn_warmup_frac": 0.2,
+    "normalize_main_loss_terms": false,
+    "normalize_regularizer_terms": true,
+    "loss_ema_decay": 0.95,
+    "loss_norm_eps": 1e-06,
+    "val_frac": 0.0
+  },
+  "fixed_preprocessing_constants": {
+    "DT": 0.1,
+    "FIELD_X_MIN": 0.0,
+    "FIELD_X_MAX": 120.0,
+    "FIELD_Y_MIN": 0.0,
+    "FIELD_Y_MAX": 53.3,
+    "height_default_inches": 72.0,
+    "weight_default_lbs": 210.0,
+    "age_default_years": 27.0,
+    "savgol_window": 7,
+    "savgol_poly": 2,
+    "lowpass_cutoff_hz": 2.5,
+    "lowpass_order": 2,
+    "despike_window_radius": 2,
+    "despike_n_sigmas": 3.0
+  }
+}
