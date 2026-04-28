@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
 import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_squared_error
@@ -29,6 +30,22 @@ REQUIRED_INPUT_COLUMNS = {
 }
 
 REQUIRED_OUTPUT_COLUMNS = {"game_id", "play_id", "nfl_id", "frame_id", "x", "y"}
+
+# Metadata columns are kept for interpretation/evaluation tables only.
+# They are not used as raw model features.
+OPTIONAL_PLAYER_METADATA_COLUMNS = [
+    "display_name",
+    "player_name",
+    "position",
+    "player_position",
+    "player_role",
+    "role",
+    "player_side",
+    "side",
+    "club",
+    "team",
+    "team_abbr",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,6 +92,30 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=42,
         help="Random seed for XGBoost. Default: 42",
+    )
+    parser.add_argument(
+        "--top-n-player-table",
+        type=int,
+        default=5,
+        help="How many best/worst player-level rows to print. Default: 5",
+    )
+    parser.add_argument(
+        "--max-horizon-plot",
+        type=int,
+        default=20,
+        help=(
+            "Maximum prediction horizon to show in the horizon plot. "
+            "Use 0 to plot all horizons. Default: 20"
+        ),
+    )
+    parser.add_argument(
+        "--min-horizon-count-ratio",
+        type=float,
+        default=0.10,
+        help=(
+            "Only plot horizons with at least this fraction of the maximum horizon sample count. "
+            "Default: 0.10"
+        ),
     )
     return parser.parse_args()
 
@@ -202,6 +243,10 @@ def build_training_table(input_df: pd.DataFrame, output_df: pd.DataFrame, last_k
                 "target_dx": float(future_row["x"] - last_x),
                 "target_dy": float(future_row["y"] - last_y),
             }
+            for meta_col in OPTIONAL_PLAYER_METADATA_COLUMNS:
+                if meta_col in last_obs.index:
+                    row[meta_col] = last_obs[meta_col]
+
             row.update(feat)
             rows.append(row)
 
@@ -224,7 +269,13 @@ def get_feature_columns(df: pd.DataFrame) -> List[str]:
         "target_dx",
         "target_dy",
     }
-    return [c for c in df.columns if c not in ignore]
+    ignore.update(OPTIONAL_PLAYER_METADATA_COLUMNS)
+
+    # Keep the model input numeric. Metadata columns are kept only for evaluation output.
+    return [
+        c for c in df.columns
+        if c not in ignore and pd.api.types.is_numeric_dtype(df[c])
+    ]
 
 
 def make_xgb_model(random_state: int) -> XGBRegressor:
@@ -241,13 +292,380 @@ def make_xgb_model(random_state: int) -> XGBRegressor:
         n_jobs=-1,
     )
 
+def compute_prediction_metrics(df: pd.DataFrame) -> dict:
+    dx2 = (df["pred_x"] - df["target_x"]) ** 2
+    dy2 = (df["pred_y"] - df["target_y"]) ** 2
+
+    rmse_x = float(np.sqrt(np.mean(dx2)))
+    rmse_y = float(np.sqrt(np.mean(dy2)))
+    kaggle_score = float(np.sqrt(np.mean((dx2 + dy2) / 2.0)))
+
+    return {
+        "rmse_x": rmse_x,
+        "rmse_y": rmse_y,
+        "kaggle_score": kaggle_score,
+        "n_rows": int(len(df)),
+    }
+
+
+def evaluate_validation_predictions(val_predictions: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
+    overall = compute_prediction_metrics(val_predictions)
+    overall["val_weeks"] = sorted(val_predictions["source_week"].unique().tolist())
+
+    by_week_rows = []
+    for week, group in val_predictions.groupby("source_week", sort=True):
+        row = {"week": int(week)}
+        row.update(compute_prediction_metrics(group))
+        by_week_rows.append(row)
+
+    by_week_df = pd.DataFrame(by_week_rows)
+    return overall, by_week_df
+
+
+def add_prediction_error_columns(val_predictions: pd.DataFrame) -> pd.DataFrame:
+    """Add per-row error columns used for report-level evaluation."""
+    out = val_predictions.copy()
+
+    out["error_x"] = out["pred_x"] - out["target_x"]
+    out["error_y"] = out["pred_y"] - out["target_y"]
+    out["abs_error_x"] = out["error_x"].abs()
+    out["abs_error_y"] = out["error_y"].abs()
+    out["squared_error_x"] = out["error_x"] ** 2
+    out["squared_error_y"] = out["error_y"] ** 2
+
+    # Spatial error in yards. This is easier to interpret than coordinate-wise RMSE.
+    out["euclidean_error"] = np.sqrt(out["squared_error_x"] + out["squared_error_y"])
+
+    # Per-row contribution in the same coordinate scale as the official score.
+    # The overall official score is computed after averaging squared errors, so this
+    # column is mainly useful for sorting individual predictions, not replacing the
+    # official aggregate score.
+    out["row_coordinate_error"] = np.sqrt(
+        (out["squared_error_x"] + out["squared_error_y"]) / 2.0
+    )
+
+    return out
+
+
+def compute_error_distribution_summary(val_predictions_with_errors: pd.DataFrame) -> pd.DataFrame:
+    """Summarise the distribution of point-level prediction errors."""
+    df = val_predictions_with_errors
+
+    summary = {
+        "n_rows": int(len(df)),
+        "best_euclidean_error": float(df["euclidean_error"].min()),
+        "mean_euclidean_error": float(df["euclidean_error"].mean()),
+        "median_euclidean_error": float(df["euclidean_error"].median()),
+        "p75_euclidean_error": float(df["euclidean_error"].quantile(0.75)),
+        "p90_euclidean_error": float(df["euclidean_error"].quantile(0.90)),
+        "p95_euclidean_error": float(df["euclidean_error"].quantile(0.95)),
+        "worst_euclidean_error": float(df["euclidean_error"].max()),
+        "mean_abs_error_x": float(df["abs_error_x"].mean()),
+        "mean_abs_error_y": float(df["abs_error_y"].mean()),
+    }
+
+    return pd.DataFrame([summary])
+
+
+def compute_error_by_horizon(val_predictions_with_errors: pd.DataFrame) -> pd.DataFrame:
+    """Evaluate how prediction error changes as the future horizon increases."""
+    df = val_predictions_with_errors
+    horizon_col = "horizon_t" if "horizon_t" in df.columns else "future_frame_id"
+
+    rows = []
+    for horizon, group in df.groupby(horizon_col, sort=True):
+        row = {horizon_col: int(horizon)}
+        row.update(compute_prediction_metrics(group))
+        row.update(
+            {
+                "mean_euclidean_error": float(group["euclidean_error"].mean()),
+                "median_euclidean_error": float(group["euclidean_error"].median()),
+                "p90_euclidean_error": float(group["euclidean_error"].quantile(0.90)),
+                "best_euclidean_error": float(group["euclidean_error"].min()),
+                "worst_euclidean_error": float(group["euclidean_error"].max()),
+            }
+        )
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def compute_error_by_play(val_predictions_with_errors: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate prediction errors at play level to identify best and worst plays."""
+    df = val_predictions_with_errors
+
+    group_cols = ["source_week", "game_id", "play_id"]
+    if "play_key" in df.columns:
+        group_cols.append("play_key")
+
+    by_play = (
+        df.groupby(group_cols, sort=False)
+        .agg(
+            n_predictions=("euclidean_error", "size"),
+            mean_euclidean_error=("euclidean_error", "mean"),
+            median_euclidean_error=("euclidean_error", "median"),
+            p90_euclidean_error=("euclidean_error", lambda x: x.quantile(0.90)),
+            max_euclidean_error=("euclidean_error", "max"),
+            mean_abs_error_x=("abs_error_x", "mean"),
+            mean_abs_error_y=("abs_error_y", "mean"),
+            mean_row_coordinate_error=("row_coordinate_error", "mean"),
+        )
+        .reset_index()
+    )
+
+    return by_play
+
+def compute_error_by_player(val_predictions_with_errors: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate prediction errors by player-play case for best/worst examples."""
+    df = val_predictions_with_errors
+
+    meta_cols = [c for c in OPTIONAL_PLAYER_METADATA_COLUMNS if c in df.columns]
+    group_cols = ["source_week", "game_id", "play_id", "nfl_id"] + meta_cols
+
+    rows = []
+    for keys, group in df.groupby(group_cols, sort=False, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = dict(zip(group_cols, keys))
+        metrics = compute_prediction_metrics(group)
+
+        best_idx = group["euclidean_error"].idxmin()
+        worst_idx = group["euclidean_error"].idxmax()
+        best_row = group.loc[best_idx]
+        worst_row = group.loc[worst_idx]
+
+        row.update(
+            {
+                "n_predicted_frames": int(len(group)),
+                "first_future_frame": int(group["future_frame_id"].min()),
+                "last_future_frame": int(group["future_frame_id"].max()),
+                "num_frames_output": int(round(float(group["num_frames_output"].max())))
+                if "num_frames_output" in group.columns
+                else int(len(group)),
+                "official_score": float(metrics["kaggle_score"]),
+                "mean_euclidean_error": float(group["euclidean_error"].mean()),
+                "median_euclidean_error": float(group["euclidean_error"].median()),
+                "max_euclidean_error": float(group["euclidean_error"].max()),
+                "best_frame_id": int(best_row["future_frame_id"]),
+                "best_frame_error": float(best_row["euclidean_error"]),
+                "worst_frame_id": int(worst_row["future_frame_id"]),
+                "worst_frame_error": float(worst_row["euclidean_error"]),
+                "mean_abs_error_x": float(group["abs_error_x"].mean()),
+                "mean_abs_error_y": float(group["abs_error_y"].mean()),
+            }
+        )
+        rows.append(row)
+
+    by_player = pd.DataFrame(rows)
+    return by_player
+
+
+def _format_extreme_player_table(df: pd.DataFrame, top_n: int, ascending: bool) -> pd.DataFrame:
+    """Select and format best/worst player-play rows for console printing."""
+    selected = df.sort_values("official_score", ascending=ascending).head(top_n).copy()
+    selected.insert(0, "rank", range(1, len(selected) + 1))
+
+    preferred_cols = [
+        "rank",
+        "source_week",
+        "game_id",
+        "play_id",
+        "nfl_id",
+        "display_name",
+        "player_name",
+        "position",
+        "player_position",
+        "player_role",
+        "role",
+        "player_side",
+        "side",
+        "club",
+        "team",
+        "team_abbr",
+        "n_predicted_frames",
+        "official_score",
+        "mean_euclidean_error",
+        "median_euclidean_error",
+        "max_euclidean_error",
+        "best_frame_id",
+        "best_frame_error",
+        "worst_frame_id",
+        "worst_frame_error",
+    ]
+    preferred_cols = [c for c in preferred_cols if c in selected.columns]
+    selected = selected[preferred_cols]
+
+    numeric_cols = selected.select_dtypes(include=[np.number]).columns
+    selected[numeric_cols] = selected[numeric_cols].round(4)
+    return selected
+
+
+def print_best_worst_player_tables(error_by_player_df: pd.DataFrame, top_n: int = 5) -> None:
+    """Print best/worst player-play examples directly in the console; do not save them."""
+    best_table = _format_extreme_player_table(error_by_player_df, top_n=top_n, ascending=True)
+    worst_table = _format_extreme_player_table(error_by_player_df, top_n=top_n, ascending=False)
+
+    pd.set_option("display.width", 220)
+    pd.set_option("display.max_columns", 40)
+
+    print(f"\nBest {top_n} player-play prediction cases by official score:")
+    print(best_table.to_string(index=False))
+
+    print(f"\nWorst {top_n} player-play prediction cases by official score:")
+    print(worst_table.to_string(index=False))
+
+
+def save_additional_evaluation_plots(
+    val_predictions_with_errors: pd.DataFrame,
+    error_by_horizon_df: pd.DataFrame,
+    output_dir: Path,
+    max_horizon_plot: int = 20,
+    min_horizon_count_ratio: float = 0.10,
+) -> None:
+    """Save visualisations for the final report.
+
+    The full horizon statistics are still saved to CSV. The plot is intentionally
+    limited to horizons with enough examples, because very late horizons often have
+    much smaller sample sizes and can make the trend look noisy.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # The full distribution has a long tail. Clipping at the 99th percentile makes
+    # the main body of the distribution easier to read while the CSV still keeps
+    # the true maximum error.
+    error_upper = float(val_predictions_with_errors["euclidean_error"].quantile(0.99))
+    errors_to_plot = val_predictions_with_errors.loc[
+        val_predictions_with_errors["euclidean_error"] <= error_upper,
+        "euclidean_error",
+    ]
+
+    plt.figure(figsize=(8, 5))
+    plt.hist(errors_to_plot, bins=50)
+    plt.axvline(val_predictions_with_errors["euclidean_error"].median(), linestyle="--", label="Median")
+    plt.axvline(val_predictions_with_errors["euclidean_error"].mean(), linestyle="-", label="Mean")
+    plt.xlabel("Euclidean prediction error (yards)")
+    plt.ylabel("Number of predictions")
+    plt.title("Distribution of validation prediction errors")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "error_distribution.png", dpi=300)
+    plt.close()
+
+    horizon_col = "horizon_t" if "horizon_t" in error_by_horizon_df.columns else "future_frame_id"
+    horizon_plot_df = error_by_horizon_df.copy()
+
+    if max_horizon_plot and max_horizon_plot > 0:
+        horizon_plot_df = horizon_plot_df[horizon_plot_df[horizon_col] <= max_horizon_plot]
+
+    max_count = horizon_plot_df["n_rows"].max() if len(horizon_plot_df) else 0
+    min_count = max_count * min_horizon_count_ratio
+    if max_count > 0:
+        horizon_plot_df = horizon_plot_df[horizon_plot_df["n_rows"] >= min_count]
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    ax2 = ax1.twinx()
+
+    # Bars show how many validation rows are available at each prediction horizon.
+    bars = ax2.bar(
+        horizon_plot_df[horizon_col],
+        horizon_plot_df["n_rows"],
+        alpha=0.20,
+        label="Number of validation rows",
+    )
+    ax2.set_ylabel("Number of validation rows")
+
+    # Line shows the official validation score at each prediction horizon.
+    line, = ax1.plot(
+        horizon_plot_df[horizon_col],
+        horizon_plot_df["kaggle_score"],
+        marker="o",
+        label="Official validation score",
+    )
+    ax1.set_xlabel("Prediction horizon / future frame")
+    ax1.set_ylabel("Official validation score")
+    ax1.grid(True)
+
+    # Keep the line visually in front of the bars.
+    ax1.set_zorder(ax2.get_zorder() + 1)
+    ax1.patch.set_visible(False)
+
+    title = "Validation score and sample size by prediction horizon"
+    if max_horizon_plot and max_horizon_plot > 0:
+        title += f" (up to frame {max_horizon_plot})"
+    ax1.set_title(title)
+
+    # Combined legend for line and bars.
+    ax1.legend(
+        [line, bars],
+        [line.get_label(), bars.get_label()],
+        loc="upper left"
+    )
+
+    fig.tight_layout()
+    plt.savefig(output_dir / "error_by_prediction_horizon.png", dpi=300)
+    plt.close()
+
+
+def run_additional_evaluation(
+    val_predictions: pd.DataFrame,
+    output_dir: Path,
+    top_n_player_table: int = 5,
+    max_horizon_plot: int = 20,
+    min_horizon_count_ratio: float = 0.10,
+) -> dict:
+    """Run report-oriented validation analysis beyond the official score."""
+    print("Running additional validation analysis...")
+
+    val_predictions_with_errors = add_prediction_error_columns(val_predictions)
+    error_summary_df = compute_error_distribution_summary(val_predictions_with_errors)
+    error_by_horizon_df = compute_error_by_horizon(val_predictions_with_errors)
+    error_by_player_df = compute_error_by_player(val_predictions_with_errors)
+
+    val_predictions_with_errors.to_csv(
+        output_dir / "validation_predictions_with_errors.csv", index=False
+    )
+    error_summary_df.to_csv(output_dir / "error_distribution_summary.csv", index=False)
+    error_by_horizon_df.to_csv(output_dir / "error_by_prediction_horizon.csv", index=False)
+
+    save_additional_evaluation_plots(
+        val_predictions_with_errors=val_predictions_with_errors,
+        error_by_horizon_df=error_by_horizon_df,
+        output_dir=output_dir,
+        max_horizon_plot=max_horizon_plot,
+        min_horizon_count_ratio=min_horizon_count_ratio,
+    )
+
+    best_error = float(error_summary_df.loc[0, "best_euclidean_error"])
+    median_error = float(error_summary_df.loc[0, "median_euclidean_error"])
+    mean_error = float(error_summary_df.loc[0, "mean_euclidean_error"])
+    worst_error = float(error_summary_df.loc[0, "worst_euclidean_error"])
+
+    print("Additional validation summary:")
+    print(f"  Best point error:   {best_error:.5f} yards")
+    print(f"  Median point error: {median_error:.5f} yards")
+    print(f"  Mean point error:   {mean_error:.5f} yards")
+    print(f"  Worst point error:  {worst_error:.5f} yards")
+
+    print_best_worst_player_tables(
+        error_by_player_df=error_by_player_df,
+        top_n=top_n_player_table,
+    )
+
+    return {
+        "validation_predictions_with_errors": "validation_predictions_with_errors.csv",
+        "error_distribution_summary": "error_distribution_summary.csv",
+        "error_by_prediction_horizon": "error_by_prediction_horizon.csv",
+        "error_distribution_plot": "error_distribution.png",
+        "error_by_prediction_horizon_plot": "error_by_prediction_horizon.png",
+    }
+
 
 def train_and_evaluate(
     train_df: pd.DataFrame,
     feature_cols: Sequence[str],
     val_weeks: Sequence[int],
     random_state: int,
-) -> Tuple[XGBRegressor, XGBRegressor, dict, pd.DataFrame]:
+) -> Tuple[XGBRegressor, XGBRegressor, dict, pd.DataFrame, pd.DataFrame]:
     tr = train_df[~train_df["source_week"].isin(val_weeks)].reset_index(drop=True)
     va = train_df[train_df["source_week"].isin(val_weeks)].reset_index(drop=True)
 
@@ -273,30 +691,38 @@ def train_and_evaluate(
     pred_x = va["last_x"].to_numpy() + pred_dx
     pred_y = va["last_y"].to_numpy() + pred_dy
 
-    rmse_x = float(np.sqrt(mean_squared_error(va["target_x"], pred_x)))
-    rmse_y = float(np.sqrt(mean_squared_error(va["target_y"], pred_y)))
-    dx2 = (pred_x - va["target_x"].to_numpy()) ** 2
-    dy2 = (pred_y - va["target_y"].to_numpy()) ** 2
-    rmse_distance = float(np.sqrt(np.mean((dx2 + dy2) / 2.0)))
+    prediction_cols = [
+        "source_week",
+        "game_id",
+        "play_id",
+        "nfl_id",
+        "play_key",
+        "future_frame_id",
+        "horizon_t",
+        "horizon_frac",
+        "num_frames_output",
+        "last_x",
+        "last_y",
+        "target_x",
+        "target_y",
+    ]
+    prediction_cols.extend([c for c in OPTIONAL_PLAYER_METADATA_COLUMNS if c in va.columns])
+    prediction_cols = [c for c in prediction_cols if c in va.columns]
 
-    metrics = {
-        "train_weeks": sorted(tr["source_week"].unique().tolist()),
-        "val_weeks": sorted(va["source_week"].unique().tolist()),
-        "rmse_x": rmse_x,
-        "rmse_y": rmse_y,
-        "rmse_distance": rmse_distance,
-        "n_train_rows": int(len(tr)),
-        "n_val_rows": int(len(va)),
-        "n_features": int(len(feature_cols)),
-    }
-
-    val_predictions = va[
-        ["source_week", "game_id", "play_id", "nfl_id", "future_frame_id", "target_x", "target_y"]
-    ].copy()
+    val_predictions = va[prediction_cols].copy()
     val_predictions["pred_x"] = pred_x
     val_predictions["pred_y"] = pred_y
 
-    return model_dx, model_dy, metrics, val_predictions
+    metrics, by_week_df = evaluate_validation_predictions(val_predictions)
+
+    metrics.update({
+        "train_weeks": sorted(tr["source_week"].unique().tolist()),
+        "n_train_rows": int(len(tr)),
+        "n_val_rows": int(len(va)),
+        "n_features": int(len(feature_cols)),
+    })
+
+    return model_dx, model_dy, metrics, val_predictions, by_week_df
 
 
 def retrain_on_all_data(train_df: pd.DataFrame, feature_cols: Sequence[str], random_state: int):
@@ -375,7 +801,7 @@ def main() -> None:
     print("Training table shape:", train_df.shape)
     print("Number of features:", len(feature_cols))
 
-    eval_dx, eval_dy, metrics, val_predictions = train_and_evaluate(
+    eval_dx, eval_dy, metrics, val_predictions, val_by_week_df = train_and_evaluate(
         train_df=train_df,
         feature_cols=feature_cols,
         val_weeks=args.val_weeks,
@@ -387,6 +813,16 @@ def main() -> None:
 
     val_predictions.to_csv(output_dir / "validation_predictions.csv", index=False)
     pd.DataFrame([metrics]).to_csv(output_dir / "validation_metrics.csv", index=False)
+    val_by_week_df.to_csv(output_dir / "validation_metrics_by_week.csv", index=False)
+
+    additional_eval_files = run_additional_evaluation(
+        val_predictions=val_predictions,
+        output_dir=output_dir,
+        top_n_player_table=args.top_n_player_table,
+        max_horizon_plot=args.max_horizon_plot,
+        min_horizon_count_ratio=args.min_horizon_count_ratio,
+    )
+
     save_feature_importance(eval_dx, feature_cols, output_dir / "feature_importance_dx.csv")
     save_feature_importance(eval_dy, feature_cols, output_dir / "feature_importance_dy.csv")
 
@@ -405,6 +841,12 @@ def main() -> None:
         "last_k": int(args.last_k),
         "feature_columns": list(feature_cols),
         "metrics": metrics,
+        "additional_evaluation_settings": {
+            "top_n_player_table": int(args.top_n_player_table),
+            "max_horizon_plot": int(args.max_horizon_plot),
+            "min_horizon_count_ratio": float(args.min_horizon_count_ratio),
+        },
+        "additional_evaluation_files": additional_eval_files,
     }
     with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -413,7 +855,13 @@ def main() -> None:
     print("Saved files:")
     for name in [
         "validation_predictions.csv",
+        "validation_predictions_with_errors.csv",
         "validation_metrics.csv",
+        "validation_metrics_by_week.csv",
+        "error_distribution_summary.csv",
+        "error_by_prediction_horizon.csv",
+        "error_distribution.png",
+        "error_by_prediction_horizon.png",
         "feature_importance_dx.csv",
         "feature_importance_dy.csv",
         "final_model_dx.joblib",
